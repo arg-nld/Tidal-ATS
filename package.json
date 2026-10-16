@@ -1,0 +1,52 @@
+{
+  "name": "ats-dashboard",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently -n \"server,client\" -c \"blue,green\" \"node server/devServer.js\" \"vite\"",
+    "server": "node server/server.js",
+    "client": "vite",
+    "build": "vite build",
+    "lint": "eslint .",
+    "test:security": "node --test server/tests/*.test.js",
+    "preview": "vite preview",
+    "backup:data": "node server/scripts/backupData.js",
+    "test:reliability": "node --test server/tests/scoring.test.js server/tests/storeReliability.test.js",
+    "test:all": "node --test server/tests/*.test.js",
+    "create:hr": "node server/scripts/createHr.js",
+    "worker:email": "node server/workers/emailWorker.js",
+    "migrate:postgres": "node server/scripts/migrateToPostgres.js",
+    "start": "node server/server.js"
+  },
+  "dependencies": {
+    "@tailwindcss/vite": "^4.3.3",
+    "concurrently": "^10.0.5",
+    "cors": "^2.8.6",
+    "dotenv": "^18.0.5",
+    "express": "^5.2.1",
+    "lucide-react": "^1.49.0",
+    "mammoth": "^1.13.0",
+    "multer": "^2.4.0",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "react-router-dom": "^7.18.4",
+    "pg": "^8.16.3",
+    "@aws-sdk/client-s3": "^3.879.0",
+    "nodemailer": "^7.0.10"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.7",
+    "@vitejs/plugin-react": "^6.1.1",
+    "autoprefixer": "^10.6.1",
+    "eslint": "^10.10.0",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "eslint-plugin-react-refresh": "^0.5.6",
+    "globals": "^17.12.0",
+    "postcss": "^8.5.28",
+    "tailwindcss": "^4.3.3",
+    "vite": "^8.3.0"
+  }
+}

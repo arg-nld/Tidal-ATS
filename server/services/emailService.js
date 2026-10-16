@@ -1,0 +1,424 @@
+import { store } from './store.js';
+import { validEmail, cleanString } from '../middleware/inputValidation.js';
+
+const EMAIL_MAX_RETRIES = Math.max(1, Math.min(5, Number(process.env.EMAIL_MAX_RETRIES || 3)));
+const EMAIL_RETRY_BASE_MS = Math.max(250, Number(process.env.EMAIL_RETRY_BASE_MS || 750));
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function getEmailType(idempotencyKey = '') {
+  const key = String(idempotencyKey);
+  if (key.startsWith('verify/')) return 'verification';
+  if (key.startsWith('application-stage/')) return 'application-stage';
+  return 'transactional';
+}
+
+function shouldRetryEmail(err) {
+  const status = Number(err?.status || 0);
+  return !status || status === 408 || status === 409 || status === 429 || status >= 500;
+}
+
+function requireEmailConfig() {
+  const provider = String(process.env.EMAIL_PROVIDER || 'resend').trim().toLowerCase();
+  const from = process.env.EMAIL_FROM?.trim() || process.env.GMAIL_USER?.trim();
+  if (!from) throw new Error('Email delivery is not configured. Set EMAIL_FROM (or GMAIL_USER for Gmail SMTP).');
+  if (['gmail', 'smtp'].includes(provider)) {
+    const user = process.env.GMAIL_USER?.trim();
+    const pass = process.env.GMAIL_APP_PASSWORD?.replace(/\s/g, '');
+    if (!user || !pass) throw new Error('Gmail SMTP requires GMAIL_USER and GMAIL_APP_PASSWORD. Use a Google App Password, not your normal Gmail password.');
+    return { provider, from, user, pass };
+  }
+  const apiKey = process.env.RESEND_API_KEY?.trim();
+  if (!apiKey) throw new Error('Resend email delivery requires RESEND_API_KEY and EMAIL_FROM.');
+  return { provider: 'resend', apiKey, from };
+}
+
+function textToHtml(text = '') {
+  return String(text)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/\n/g, '<br>');
+}
+
+export function generateEmailForStatusChange({ applicant, job, newStage, interviewDetails, customNote }) {
+  const applicantName = applicant?.name || 'Applicant';
+  const jobTitle = job?.title || 'Open Position';
+  const companyName = process.env.COMPANY_NAME || 'TIDAL Solutions';
+
+  let subject = '';
+  let body = '';
+
+  switch (newStage) {
+    case 'Application Submitted':
+      subject = `Application Received: ${jobTitle} at ${companyName}`;
+      body = `Dear ${applicantName},\n\nThank you for your interest in joining ${companyName}. We have received your application for the ${jobTitle} role.\n\nOur talent acquisition team will review your qualifications and experience.\n\nBest regards,\nThe Talent Acquisition Team\n${companyName}`;
+      break;
+    case 'Initial Screening':
+      subject = `Application Update: ${jobTitle} - Screening in Progress`;
+      body = `Dear ${applicantName},\n\nYour application for ${jobTitle} is now undergoing initial review and qualification screening.\n\nWe will update you as soon as this phase concludes.\n\nWarm regards,\n${companyName} Recruiting`;
+      break;
+    case 'Shortlisted':
+      subject = `Great News! You've been shortlisted for ${jobTitle}`;
+      body = `Dear ${applicantName},\n\nCongratulations! Your profile has been shortlisted for the ${jobTitle} position at ${companyName}.\n\nOur recruiting team will contact you shortly regarding next steps.\n\nSincerely,\n${companyName} Talent Team`;
+      break;
+    case 'Interview Scheduled':
+      subject = `Interview Scheduled: ${jobTitle} with ${companyName}`;
+      body = `Dear ${applicantName},\n\nYour interview for ${jobTitle} has been scheduled.\n\nDate & Time: ${interviewDetails?.scheduledAt ? new Date(interviewDetails.scheduledAt).toLocaleString() : 'To be confirmed'}\nInterviewer(s): ${interviewDetails?.interviewer || 'Recruiting Team'}\nMeeting Link: ${interviewDetails?.meetingLink || 'To be confirmed'}\n\n${interviewDetails?.emailBody || interviewDetails?.notes || 'Please be ready a few minutes before the scheduled time.'}\n\nBest regards,\n${companyName} Hiring Team`;
+      break;
+    case 'Job Offer':
+      subject = `Job Offer: ${jobTitle} at ${companyName}`;
+      body = `Dear ${applicantName},\n\nWe are pleased to extend a job offer for the position of ${jobTitle} at ${companyName}. Please review the offer documentation provided by the hiring team.\n\nWarm regards,\n${companyName} Talent Team`;
+      break;
+    case 'Hired':
+      subject = `Official Welcome to ${companyName} - You're Hired!`;
+      body = `Dear ${applicantName},\n\nWelcome to the team! We are pleased to confirm that your hiring process for ${jobTitle} is complete.\n\nOur People Operations team will contact you with onboarding information.\n\nWelcome aboard!\n${companyName} People & Culture`;
+      break;
+    case 'Rejected':
+      subject = `Update regarding your application for ${jobTitle}`;
+      body = `Dear ${applicantName},\n\nThank you for taking the time to apply for the ${jobTitle} position with ${companyName}. We have decided to move forward with another candidate whose background more closely matches our current needs.\n\nWe appreciate your interest and wish you the best in your career.\n\nRespectfully,\nThe Talent Acquisition Team\n${companyName}`;
+      break;
+    default:
+      subject = `Status Update on your application for ${jobTitle}`;
+      body = `Dear ${applicantName},\n\nYour application for ${jobTitle} at ${companyName} has been updated to "${newStage}".${customNote ? `\n\nNote from recruiter:\n${customNote}` : ''}\n\nBest regards,\n${companyName} Talent Team`;
+  }
+
+  return { subject, body };
+}
+
+async function deliverEmailNow({
+  to,
+  subject,
+  body,
+  html,
+  attachments = [],
+  idempotencyKey,
+  _skipLog = false,
+  maxAttempts = EMAIL_MAX_RETRIES
+}) {
+  const emailConfig = requireEmailConfig();
+  const { from } = emailConfig;
+
+  const recipients = (Array.isArray(to) ? to : [to]).map(recipient => validEmail(recipient));
+  const safeSubject = cleanString(subject, { field: 'Email subject', max: 200, min: 1, allowEmpty: false, singleLine: true });
+  const safeBody = cleanString(body, { field: 'Email body', max: 20000, allowEmpty: true });
+
+  const payload = {
+    from,
+    to: recipients,
+    subject: safeSubject,
+    text: safeBody,
+    html: html || `<div style="font-family:Arial,sans-serif;line-height:1.6">${textToHtml(safeBody)}</div>`
+  };
+
+  if (attachments.length) {
+    if (attachments.length > 5) throw new Error('A maximum of 5 email attachments is allowed.');
+    const totalBytes = attachments.reduce((sum, file) => sum + Number(file.size || 0), 0);
+    if (totalBytes > 20 * 1024 * 1024) throw new Error('Combined email attachments cannot exceed 20 MB.');
+    payload.attachments = attachments.map(file => ({
+      filename: String(file.filename || 'attachment').replace(/[^a-zA-Z0-9._ -]/g, '_').slice(0, 180),
+      content: file.contentBase64 || file.content
+    }));
+  }
+
+  const log = _skipLog ? null : await store.createEmailLog({
+    to: recipients,
+    subject: safeSubject,
+    type: getEmailType(idempotencyKey),
+    idempotencyKey,
+    status: 'sending',
+    attempts: 0
+  });
+
+  // The store may return an existing log for an idempotency key. Avoid sending
+  // a second message when that key already completed successfully.
+  if (log?.status === 'sent') {
+    return {
+      id: log.providerMessageId || log.provider_message_id || log.id,
+      alreadySent: true
+    };
+  }
+  if (log && ['failed', 'retrying', 'queued'].includes(log.status)) {
+    await store.updateEmailLog(log.id, {
+      status: 'sending',
+      attempts: 0,
+      error: null
+    });
+  }
+
+  let lastError = null;
+
+  const attemptLimit = Math.max(1, Number(maxAttempts) || 1);
+  for (let attempt = 1; attempt <= attemptLimit; attempt += 1) {
+    try {
+      if (emailConfig.provider === 'gmail' || emailConfig.provider === 'smtp') {
+        const nodemailer = await import('nodemailer');
+        const transporter = nodemailer.createTransport({
+          service: 'gmail',
+          auth: { user: emailConfig.user, pass: emailConfig.pass }
+        });
+        const result = await transporter.sendMail({
+          from,
+          to: recipients,
+          subject: safeSubject,
+          text: safeBody,
+          html: html || `<div style="font-family:Arial,sans-serif;line-height:1.6">${textToHtml(safeBody)}</div>`,
+          attachments: attachments.map(file => ({
+            filename: String(file.filename || 'attachment').replace(/[^a-zA-Z0-9._ -]/g, '_').slice(0, 180),
+            content: file.contentBase64 || file.content
+          }))
+        });
+        if (log) await store.updateEmailLog(log.id, {
+          status: 'sent', attempts: attempt, providerMessageId: result.messageId, error: null
+        });
+        return { id: result.messageId, provider: 'gmail' };
+      }
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 15000);
+      let response;
+      try {
+        response = await fetch('https://api.resend.com/emails', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${apiKey}`,
+            ...(idempotencyKey ? { 'Idempotency-Key': idempotencyKey } : {})
+          },
+          body: JSON.stringify(payload),
+          signal: controller.signal
+        });
+      } finally {
+        clearTimeout(timeout);
+      }
+
+      const responseText = await response.text();
+      let result = null;
+      try { result = JSON.parse(responseText); } catch { /* non-JSON response */ }
+
+      if (!response.ok) {
+        const error = new Error(result?.message || result?.error || `Email provider returned HTTP ${response.status}.`);
+        error.status = response.status;
+        throw error;
+      }
+
+      if (log) await store.updateEmailLog(log.id, {
+        status: 'sent',
+        attempts: attempt,
+        providerMessageId: result?.id || null,
+        error: null
+      });
+      return result || { id: null };
+    } catch (err) {
+      lastError = err;
+      if (log) await store.updateEmailLog(log.id, {
+        status: attempt < attemptLimit && shouldRetryEmail(err) ? 'retrying' : 'failed',
+        attempts: attempt,
+        error: err?.message || 'Email delivery failed.'
+      });
+
+      if (attempt >= attemptLimit || !shouldRetryEmail(err)) break;
+      await sleep(EMAIL_RETRY_BASE_MS * (2 ** (attempt - 1)));
+    }
+  }
+
+  throw lastError || new Error('Email delivery failed.');
+}
+
+export async function sendEmail({
+  to,
+  subject,
+  body,
+  html,
+  attachments = [],
+  idempotencyKey
+}) {
+  const recipients = (Array.isArray(to) ? to : [to]).map(recipient => validEmail(recipient));
+  const safeSubject = cleanString(subject, { field: 'Email subject', max: 200, min: 1, allowEmpty: false, singleLine: true });
+  const safeBody = cleanString(body, { field: 'Email body', max: 20000, allowEmpty: true });
+
+  if (String(process.env.EMAIL_DELIVERY_MODE || 'direct').toLowerCase() === 'queue') {
+    if (!process.env.DATABASE_URL || typeof store.enqueueEmail !== 'function' || typeof store.claimEmailJobs !== 'function') {
+      throw new Error('EMAIL_DELIVERY_MODE=queue requires PostgreSQL storage. Configure DATABASE_URL or switch EMAIL_DELIVERY_MODE to direct.');
+    }
+
+    const log = await store.createEmailLog({
+      to: recipients,
+      subject: safeSubject,
+      type: getEmailType(idempotencyKey),
+      idempotencyKey,
+      status: 'queued',
+      attempts: 0
+    });
+
+    // Repeated idempotency keys must not re-enqueue an email that was already sent.
+    if (log.status === 'sent') {
+      return { id: log.provider_message_id || log.id, queued: false, alreadySent: true };
+    }
+    if (['failed', 'retrying'].includes(log.status)) {
+      await store.updateEmailLog(log.id, { status: 'queued', attempts: 0, error: null });
+    }
+
+    await store.enqueueEmail({
+      emailLogId: log.id,
+      payload: { to: recipients, subject: safeSubject, body: safeBody, html, attachments, idempotencyKey }
+    });
+    return { id: log.provider_message_id || log.id, queued: true };
+  }
+
+  return deliverEmailNow({ to: recipients, subject: safeSubject, body: safeBody, html, attachments, idempotencyKey });
+}
+
+export async function processEmailQueueOnce(limit = 10) {
+  const jobs = await store.claimEmailJobs(limit);
+  let processed = 0;
+  for (const job of jobs) {
+    try {
+      const result = await deliverEmailNow({ ...job.payload, _skipLog: true, maxAttempts: 1 });
+      await store.updateEmailLog(job.emailLogId, {
+        status: 'sent',
+        attempts: Number(job.attempts || 0) + 1,
+        providerMessageId: result?.id || null,
+        error: null
+      });
+      await store.completeEmailJob(job.id, { ok: true });
+      processed += 1;
+    } catch (err) {
+      const attempts = Number(job.attempts || 0) + 1;
+      const retry = attempts < Number(process.env.EMAIL_MAX_RETRIES || 3) && shouldRetryEmail(err);
+      await store.updateEmailLog(job.emailLogId, {
+        status: retry ? 'retrying' : 'failed',
+        attempts,
+        error: err?.message || 'Email delivery failed.'
+      });
+      await store.completeEmailJob(job.id, {
+        ok: false,
+        error: err?.message || 'Email delivery failed.',
+        nextAttemptAt: Date.now() + (retry ? EMAIL_RETRY_BASE_MS * (2 ** Math.max(0, attempts - 1)) : 365 * 24 * 60 * 60 * 1000)
+      });
+      processed += 1;
+    }
+  }
+  return { processed, claimed: jobs.length };
+}
+
+export async function sendStatusChangeEmail({ applicant, job, newStage, interviewDetails, customNote, attachments = [] }) {
+  if (!applicant?.email) {
+    console.warn('[EmailService] Cannot send email: applicant email missing.');
+    return null;
+  }
+
+  const generated = generateEmailForStatusChange({ applicant, job, newStage, interviewDetails, customNote });
+  const subject = interviewDetails?.emailSubject || generated.subject;
+  const body = interviewDetails?.emailBody || generated.body;
+
+  let providerResult = null;
+  let deliveryStatus = 'failed';
+  let deliveryError = null;
+
+  try {
+    providerResult = await sendEmail({
+      to: applicant.email,
+      subject,
+      body,
+      attachments,
+      idempotencyKey: `application-stage/${applicant.id}/${newStage}/${interviewDetails?.createdAt || Date.now()}`
+    });
+    deliveryStatus = providerResult?.queued ? 'queued' : 'sent';
+  } catch (err) {
+    // Internal ATS notifications should still be created even when the external
+    // email provider rejects delivery (for example while Resend is in testing mode).
+    // This keeps the candidate portal useful and makes provider failures visible.
+    deliveryError = err?.message || 'External email delivery failed.';
+    console.error(`[EmailService] External email delivery failed for ${applicant.email}:`, deliveryError);
+  }
+
+  const matchedUser = applicant?.email ? await store.getUserByEmail(applicant.email) : null;
+  const linkedUser = !matchedUser && applicant?.userId
+    ? await store.getUserById?.(applicant.userId)
+    : null;
+  const recipientUserId = matchedUser?.id || linkedUser?.id || null;
+
+  // An application can outlive its portal account. External email delivery should
+  // still be recorded, but a private in-app notification requires a real recipient.
+  if (!recipientUserId) {
+    return {
+      applicationId: applicant.id,
+      recipientEmail: applicant.email,
+      recipientName: applicant.name,
+      stage: newStage,
+      subject,
+      body,
+      deliveryStatus,
+      deliveryError,
+      providerMessageId: providerResult?.id || null,
+      emailType: 'transactional',
+      noInAppNotification: true
+    };
+  }
+
+  return store.createNotification({
+    applicationId: applicant.id,
+    recipientUserId,
+    jobId: applicant.jobId,
+    recipientEmail: applicant.email,
+    recipientName: applicant.name,
+    stage: newStage,
+    subject,
+    body,
+    deliveryStatus,
+    deliveryError,
+    providerMessageId: providerResult?.id || null,
+    emailType: 'transactional'
+  });
+}
+
+export function createHrApplicationNotification({ applicant, job, notificationStore = store }) {
+  const subject = `New application: ${job?.title || applicant?.role || 'Job Application'}`;
+  const body = `A new application has been submitted.\n\nCandidate: ${applicant?.name || 'Candidate'}\nEmail: ${applicant?.email || 'Not provided'}\nPosition: ${job?.title || applicant?.role || 'Position'}\n\nOpen the HR portal to review the application and resume.`;
+
+  const createFor = hrUsers => hrUsers.map(hr => notificationStore.createNotification({
+    applicationId: applicant.id,
+    recipientUserId: hr.id,
+    jobId: applicant.jobId,
+    recipientEmail: hr.email,
+    recipientName: hr.name,
+    stage: 'Application Submitted',
+    subject,
+    body,
+    deliveryStatus: 'internal',
+    emailType: 'hr-internal'
+  }));
+
+  const usersResult = notificationStore.getUsersByRole('hr');
+  if (usersResult && typeof usersResult.then === 'function') {
+    return usersResult.then(async hrUsers => Promise.all(createFor(hrUsers)));
+  }
+  return createFor(usersResult);
+}
+
+export async function sendVerificationEmail({ user, token }) {
+  const appUrl = (process.env.FRONTEND_URL || process.env.APP_URL || 'http://localhost:5173').replace(/\/$/, '');
+  const verifyUrl = `${appUrl}/verify-email?token=${encodeURIComponent(token)}`;
+  const body = `Hi ${user.name || 'there'},\n\nThanks for creating a TIDAL Solutions account. Please verify your email address by opening this link:\n\n${verifyUrl}\n\nThis verification link expires in 15 minutes and is for your account only.\n\nTIDAL Solutions`;
+
+  return sendEmail({
+    to: user.email,
+    subject: 'Verify your TIDAL Solutions account',
+    body,
+    idempotencyKey: `verify/${user.id}/${token}`
+  });
+}
+
+export async function sendPasswordResetEmail({ user, token }) {
+  const appUrl = (process.env.FRONTEND_URL || process.env.APP_URL || 'http://localhost:5173').replace(/\/$/, '');
+  const resetUrl = `${appUrl}/reset-password?token=${encodeURIComponent(token)}`;
+  const body = `Hi ${user.name || 'there'},\n\nWe received a request to reset your TIDAL Solutions account password. Open the link below to choose a new password. This link expires in 5 minutes and can only be used once.\n\n${resetUrl}\n\nIf you did not request this, you can ignore this email.\n\nTIDAL Solutions`;
+  return sendEmail({
+    to: user.email,
+    subject: 'Reset your TIDAL Solutions password',
+    body,
+    idempotencyKey: `password-reset/${user.id}/${token}`
+  });
+}

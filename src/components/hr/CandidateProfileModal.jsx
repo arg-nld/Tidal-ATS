@@ -1,0 +1,889 @@
+import { useEffect, useMemo, useState } from 'react';
+import { api } from '../../services/api';
+import { X, Trash2, FileText, BrainCircuit, RefreshCw, Calendar, Video, Check, CheckCircle2, Sparkles, MessageSquare, ExternalLink, ChevronRight, Paperclip, Send, Download, AlertCircle, GitMerge, Award, Clock, FileCheck } from 'lucide-react';
+import { StageBadge } from '../common/Badge';
+import { Spinner } from '../common/Spinner';
+import { ConfirmationModal } from '../common/ConfirmationModal';
+import { ScorecardTab } from './ScorecardTab';
+import { CandidateTimelineTab } from './CandidateTimelineTab';
+import { OfferManagementTab } from './OfferManagementTab';
+import { DuplicateDetectionModal } from './DuplicateDetectionModal';
+import { PIPELINE_STAGES } from '../../constants/pipeline';
+export { PIPELINE_STAGES };
+
+const pad = n => String(n).padStart(2, '0');
+const dateKey = date => `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+const formatTime = value => {
+  if (!value) return '';
+  const [hour, minute] = value.split(':').map(Number);
+  const d = new Date(); d.setHours(hour, minute, 0, 0);
+  return d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+};
+const formatDateText = date => {
+  if (!date) return 'TBD';
+  const parts = String(date).split('-').map(Number);
+  if (parts.length === 3 && parts.every(p => !Number.isNaN(p))) {
+    const d = new Date(parts[0], parts[1] - 1, parts[2]);
+    return d.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
+  }
+  const d = new Date(date);
+  return Number.isNaN(d.getTime()) ? date : d.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
+};
+const buildSlots = () => Array.from({ length: 288 }, (_, i) => { const total = i * 5; return `${pad(Math.floor(total / 60))}:${pad(total % 60)}`; });
+const timeSlots = buildSlots();
+const defaultInterviewBody = (candidate, job, date, time, interviewer = '', meetingLink = '') => 
+`Hi ${candidate?.name || 'there'},
+
+We would like to invite you to an interview for the ${job?.title || candidate?.role || 'position'}.
+
+Date: ${formatDateText(date)}
+Time: ${formatTime(time) || 'TBD'}
+Interviewer(s): ${interviewer || 'TBD'}
+Meeting link: ${meetingLink || 'To be provided'}
+
+Please reply to this email if you need to discuss the schedule.
+
+Best regards,
+Tidal Talent Team`;
+
+export function CandidateProfileModal({ candidate, job, applications = [], onClose, onUpdateCandidate, onDelete, onInterviewScheduled }) {
+  if (!candidate) return null;
+
+  const [activeTab, setActiveTab] = useState('overview');
+  const [targetStage, setTargetStage] = useState(candidate.stage);
+  const [stageNote, setStageNote] = useState('');
+  const [isUpdatingStage, setIsUpdatingStage] = useState(false);
+  const [notes, setNotes] = useState(candidate.recruiterNotes || '');
+  const [isSavingNotes, setIsSavingNotes] = useState(false);
+  const [notesSaved, setNotesSaved] = useState(false);
+  const [isScreening, setIsScreening] = useState(false);
+  const [screeningError, setScreeningError] = useState(null);
+
+  // Confirmation Modals State
+  const [showStageConfirmModal, setShowStageConfirmModal] = useState(false);
+  const [showNotesConfirmModal, setShowNotesConfirmModal] = useState(false);
+  const [showScreeningConfirmModal, setShowScreeningConfirmModal] = useState(false);
+  const [showDeleteConfirmModal, setShowDeleteConfirmModal] = useState(false);
+
+  // ATS duplicate detection & merge modal state
+  const [duplicates, setDuplicates] = useState([]);
+  const [checkingDuplicates, setCheckingDuplicates] = useState(false);
+  const [showDuplicateModal, setShowDuplicateModal] = useState(false);
+
+  const existingInterview = candidate.interview;
+  const initialDate = existingInterview?.scheduledAt ? new Date(existingInterview.scheduledAt) : new Date();
+  const [interviewDate, setInterviewDate] = useState(dateKey(initialDate));
+  const initialMinute = Math.floor(initialDate.getMinutes() / 5) * 5;
+  const [timeIndex, setTimeIndex] = useState(Math.max(0, timeSlots.indexOf(`${pad(initialDate.getHours())}:${pad(initialMinute)}`)));
+  const [interviewer, setInterviewer] = useState(existingInterview?.interviewer || 'Sarah Lin (Talent Lead)');
+  const [meetingLink, setMeetingLink] = useState(existingInterview?.meetingLink || '');
+  const [emailSubject, setEmailSubject] = useState(existingInterview?.emailSubject || `Interview Invitation — ${job?.title || candidate.role || 'Position'}`);
+  const initialTime = timeSlots[Math.max(0, timeSlots.indexOf(`${pad(initialDate.getHours())}:${pad(initialMinute)}`))] || '09:00';
+  const initialInterviewer = existingInterview?.interviewer || 'Sarah Lin (Talent Lead)';
+  const initialMeetingLink = existingInterview?.meetingLink || '';
+  const [emailBody, setEmailBody] = useState(existingInterview?.emailBody || defaultInterviewBody(candidate, job, dateKey(initialDate), initialTime, initialInterviewer, initialMeetingLink));
+  const [attachments, setAttachments] = useState([]);
+  const [attachmentError, setAttachmentError] = useState(null);
+  const [bookings, setBookings] = useState([]);
+  const [loadingAvailability, setLoadingAvailability] = useState(false);
+  const [isScheduling, setIsScheduling] = useState(false);
+  const [interviewSuccess, setInterviewSuccess] = useState(false);
+  const [showScheduleConfirmation, setShowScheduleConfirmation] = useState(false);
+  const [timeWheelMotion, setTimeWheelMotion] = useState(null);
+  const [resumeUrl, setResumeUrl] = useState(null);
+  const [resumeLoading, setResumeLoading] = useState(false);
+  const [resumeError, setResumeError] = useState(null);
+
+  const selectedTime = timeSlots[timeIndex] || '09:00';
+  const [selectedHour, selectedMinute] = selectedTime.split(':').map(Number);
+  const displayHour = selectedHour > 12 ? selectedHour - 12 : selectedHour === 0 ? 12 : selectedHour;
+  const displayPeriod = selectedHour >= 12 ? 'PM' : 'AM';
+  const slotDateTime = `${interviewDate}T${selectedTime}`;
+
+  const bookedSlotSet = useMemo(() => {
+    const set = new Set();
+    bookings.forEach(item => {
+      const d = new Date(item.scheduledAt);
+      if (Number.isNaN(d.getTime())) return;
+      set.add(`${pad(d.getHours())}:${pad(d.getMinutes())}`);
+    });
+    return set;
+  }, [bookings]);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoadingAvailability(true);
+    api.applications.getAvailability(interviewDate, candidate.id)
+      .then(res => { if (!cancelled) setBookings(res.bookings || []); })
+      .catch(err => { if (!cancelled) setBookings([]); console.warn('Availability load failed:', err); })
+      .finally(() => { if (!cancelled) setLoadingAvailability(false); });
+    return () => { cancelled = true; };
+  }, [interviewDate, candidate.id]);
+
+  useEffect(() => {
+    if (!bookings.length) return;
+    if (!bookedSlotSet.has(selectedTime)) return;
+
+    const firstAvailable = timeSlots.findIndex(time => !bookedSlotSet.has(time));
+    if (firstAvailable >= 0 && firstAvailable !== timeIndex) {
+      setTimeIndex(firstAvailable);
+    }
+  }, [bookings, bookedSlotSet, selectedTime, timeIndex]);
+
+  useEffect(() => {
+    if (activeTab !== 'resume' || resumeUrl || resumeLoading) return;
+    handleViewResume();
+  }, [activeTab, candidate.id]);
+
+  useEffect(() => {
+    setTargetStage(candidate.stage);
+    setNotes(candidate.recruiterNotes || '');
+    if (candidate.interview?.scheduledAt) {
+      const d = new Date(candidate.interview.scheduledAt);
+      const nextIndex = timeSlots.indexOf(`${pad(d.getHours())}:${pad(Math.floor(d.getMinutes() / 5) * 5)}`);
+      const scheduledDate = dateKey(d);
+      const scheduledTime = nextIndex >= 0 ? timeSlots[nextIndex] : '09:00';
+      const scheduledInterviewer = candidate.interview.interviewer || interviewer;
+      const scheduledLink = candidate.interview.meetingLink || '';
+      setInterviewDate(scheduledDate);
+      setTimeIndex(nextIndex >= 0 ? nextIndex : 2);
+      setInterviewer(scheduledInterviewer);
+      setMeetingLink(scheduledLink);
+      setEmailSubject(candidate.interview.emailSubject || `Interview Invitation — ${job?.title || candidate.role || 'Position'}`);
+      setEmailBody(candidate.interview.emailBody || defaultInterviewBody(candidate, job, scheduledDate, scheduledTime, scheduledInterviewer, scheduledLink));
+    }
+  }, [candidate.id]);
+
+  useEffect(() => {
+    if (!candidate?.id) return;
+    setCheckingDuplicates(true);
+    api.applications.getDuplicates(candidate.id)
+      .then(res => setDuplicates(res.duplicates || []))
+      .catch(err => {
+        console.warn('Duplicate detection check failed:', err);
+        setDuplicates([]);
+      })
+      .finally(() => setCheckingDuplicates(false));
+  }, [candidate.id]);
+
+  const handleUpdateStage = () => {
+    if (targetStage === candidate.stage) return;
+    setShowStageConfirmModal(true);
+  };
+
+  const handleExecuteUpdateStage = async () => {
+    setIsUpdatingStage(true);
+    try {
+      const res = await api.applications.updateStage(candidate.id, { stage: targetStage, customNote: stageNote });
+      onUpdateCandidate(res.application);
+      setShowStageConfirmModal(false);
+    } catch (err) {
+      alert(err.message || 'We could not update the candidate stage. Please try again.');
+    } finally {
+      setIsUpdatingStage(false);
+    }
+  };
+
+  const handleSaveNotes = () => {
+    setShowNotesConfirmModal(true);
+  };
+
+  const handleExecuteSaveNotes = async () => {
+    setIsSavingNotes(true);
+    try {
+      const res = await api.applications.updateNotes(candidate.id, notes);
+      onUpdateCandidate(res.application);
+      setNotesSaved(true);
+      setTimeout(() => setNotesSaved(false), 2500);
+      setShowNotesConfirmModal(false);
+    } catch (err) {
+      alert(err.message || 'We could not save the notes. Please try again.');
+    } finally {
+      setIsSavingNotes(false);
+    }
+  };
+
+  const handleScreenCandidate = () => {
+    setShowScreeningConfirmModal(true);
+  };
+
+  const handleExecuteScreenCandidate = async () => {
+    setIsScreening(true);
+    setScreeningError(null);
+    try {
+      const res = await api.ai.screen(candidate.id);
+      onUpdateCandidate(res.application);
+      setShowScreeningConfirmModal(false);
+    } catch (err) {
+      setScreeningError(err.message || 'Screening failed');
+    } finally {
+      setIsScreening(false);
+    }
+  };
+
+  const ALLOWED_ATTACHMENT_EXTENSIONS = ['.pdf', '.docx', '.doc', '.txt', '.png', '.jpg', '.jpeg', '.webp', '.ics'];
+
+  const validateInterviewSchedule = () => {
+    if (!interviewDate || !selectedTime || !interviewer.trim()) {
+      alert('Please provide interview date, time, and interviewer.');
+      return false;
+    }
+    if (!emailSubject.trim() || !emailBody.trim()) {
+      alert('Please provide the email subject and body.');
+      return false;
+    }
+    if (bookedSlotSet.has(selectedTime)) {
+      alert('That time is already booked. Choose another time.');
+      return false;
+    }
+    if (attachments.length > 5) {
+      alert('You can attach at most 5 files.');
+      return false;
+    }
+    return true;
+  };
+
+  const handleAttachmentChange = e => {
+    setAttachmentError(null);
+    const newFiles = Array.from(e.target.files || []);
+    if (!newFiles.length) return;
+
+    e.target.value = '';
+
+    const combined = [...attachments, ...newFiles];
+    if (combined.length > 5) {
+      setAttachmentError('You can attach at most 5 files in total.');
+      return;
+    }
+
+    for (const file of newFiles) {
+      const ext = '.' + (file.name.split('.').pop() || '').toLowerCase();
+      if (!ALLOWED_ATTACHMENT_EXTENSIONS.includes(ext)) {
+        setAttachmentError(`"${file.name}" is not supported. Supported: PDF, DOCX, DOC, TXT, PNG, JPG, WEBP, and ICS.`);
+        return;
+      }
+      if (file.size > 10 * 1024 * 1024) {
+        setAttachmentError(`"${file.name}" exceeds the 10 MB limit.`);
+        return;
+      }
+    }
+
+    const totalBytes = combined.reduce((sum, f) => sum + Number(f.size || 0), 0);
+    if (totalBytes > 20 * 1024 * 1024) {
+      setAttachmentError('Combined attachments exceed the 20 MB total limit.');
+      return;
+    }
+
+    setAttachments(combined);
+  };
+
+  const handleRemoveAttachment = indexToRemove => {
+    setAttachments(prev => prev.filter((_, idx) => idx !== indexToRemove));
+    setAttachmentError(null);
+  };
+
+  // First click only opens the safety review. No interview is created and no
+  // email is sent until the HR user confirms the final details.
+  const handleScheduleInterview = e => {
+    e.preventDefault();
+    if (!validateInterviewSchedule()) return;
+    setShowScheduleConfirmation(true);
+  };
+
+  const handleConfirmScheduleInterview = async () => {
+    if (!validateInterviewSchedule()) {
+      setShowScheduleConfirmation(false);
+      return;
+    }
+
+    setIsScheduling(true);
+    setInterviewSuccess(false);
+    try {
+      const data = new FormData();
+      data.append('scheduledAt', slotDateTime);
+      data.append('interviewer', interviewer);
+      data.append('meetingLink', meetingLink);
+      data.append('notes', '');
+      data.append('emailSubject', emailSubject);
+      let finalBody = emailBody
+        .replace(/Interviewer\(s\):\s*\[add interviewer name above\]/gi, `Interviewer(s): ${interviewer.trim() || 'TBD'}`)
+        .replace(/Meeting link:\s*\[add meeting link above\]/gi, `Meeting link: ${meetingLink.trim() || 'To be provided'}`);
+      data.append('emailBody', finalBody);
+      attachments.forEach(file => data.append('emailAttachments', file));
+      const res = await api.applications.scheduleInterview(candidate.id, data);
+      onUpdateCandidate(res.application);
+      setInterviewSuccess(true);
+      setTargetStage('Interview Scheduled');
+      setAttachments([]);
+      setAttachmentError(null);
+      setShowScheduleConfirmation(false);
+
+      if (onInterviewScheduled) {
+        onInterviewScheduled({
+          candidate: res.application,
+          interview: res.application.interview || {
+            scheduledAt: slotDateTime,
+            interviewer,
+            meetingLink
+          },
+          meetingLink: meetingLink || res.application.interview?.meetingLink || '',
+          emailSent: res.emailSent,
+          message: res.message
+        });
+      }
+      onClose();
+    } catch (err) {
+      alert(err.message || 'We could not schedule the interview. Please try again.');
+    } finally {
+      setIsScheduling(false);
+    }
+  };
+
+  const syncBodyField = (field, value) => {
+    setEmailBody(prev => {
+      const escaped = field.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const reg = new RegExp(`${escaped}:[^\\n]*`, 'i');
+      if (reg.test(prev)) {
+        return prev.replace(reg, `${field}: ${value}`);
+      }
+      return prev;
+    });
+  };
+
+  const handleInterviewerChange = value => {
+    setInterviewer(value);
+    syncBodyField('Interviewer(s)', value.trim() || 'TBD');
+  };
+
+  const handleMeetingLinkChange = value => {
+    setMeetingLink(value);
+    syncBodyField('Meeting link', value.trim() || 'To be provided');
+  };
+
+  const handleDateChange = value => {
+    setInterviewDate(value);
+    syncBodyField('Date', formatDateText(value));
+  };
+
+  const triggerTimeWheelMotion = (column, direction) => {
+    setTimeWheelMotion({ column, direction, key: Date.now() });
+    window.setTimeout(() => setTimeWheelMotion(null), 190);
+  };
+
+  const setTimeIndexAndBody = (nextIndex, column = null, direction = 0) => {
+    if (nextIndex < 0 || nextIndex >= timeSlots.length || bookedSlotSet.has(timeSlots[nextIndex])) return;
+    setTimeIndex(nextIndex);
+    syncBodyField('Time', formatTime(timeSlots[nextIndex]) || 'TBD');
+    if (column && direction) triggerTimeWheelMotion(column, direction);
+  };
+
+  const changeTimeByMinutes = direction => {
+    const nextMinutes = selectedHour * 60 + selectedMinute + direction;
+    const nextIndex = timeSlots.findIndex(slot => {
+      const [h, m] = slot.split(':').map(Number);
+      return h * 60 + m === nextMinutes;
+    });
+    if (nextIndex >= 0) setTimeIndexAndBody(nextIndex, 'Minute', direction);
+  };
+
+  const changeHour = direction => {
+    const nextHour = (selectedHour + direction + 24) % 24;
+    const nextIndex = timeSlots.findIndex(slot => {
+      const [h, m] = slot.split(':').map(Number);
+      return h === nextHour && m === selectedMinute;
+    });
+    if (nextIndex >= 0) setTimeIndexAndBody(nextIndex, 'Hour', direction);
+  };
+
+  // Minute arrows are independent from the hour. Moving past :55 wraps to :00
+  // without changing the hour; the hour arrow is the only control that changes hours.
+  const changeMinute = direction => {
+    const nextMinute = (selectedMinute + direction * 5 + 60) % 60;
+    const nextIndex = timeSlots.findIndex(slot => {
+      const [h, m] = slot.split(':').map(Number);
+      return h === selectedHour && m === nextMinute;
+    });
+    if (nextIndex >= 0) setTimeIndexAndBody(nextIndex, 'Minute', direction);
+  };
+  const changePeriod = direction => {
+    const targetHour = (selectedHour + direction * 12 + 24) % 24;
+    const nextIndex = timeSlots.findIndex(slot => {
+      const [h, m] = slot.split(':').map(Number);
+      return h === targetHour && m === selectedMinute;
+    });
+    if (nextIndex >= 0) setTimeIndexAndBody(nextIndex, 'AM/PM', direction);
+  };
+
+  const handleViewResume = async () => {
+    setActiveTab('resume');
+    if (!candidate.resumeFile) {
+      setResumeError('This legacy/demo application does not have the original uploaded file attached. New applications will retain it for HR preview.');
+      return;
+    }
+    setResumeLoading(true); setResumeError(null);
+    try {
+      const { blob } = await api.applications.getResumeBlob(candidate.id);
+      setResumeUrl(URL.createObjectURL(blob));
+      setActiveTab('resume');
+    } catch (err) { setResumeError(err.message); }
+    finally { setResumeLoading(false); }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
+      <div className="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-5xl max-h-[92vh] flex flex-col shadow-2xl overflow-hidden">
+        <div className="px-6 py-4 border-b border-slate-800 flex flex-col sm:flex-row sm:items-center justify-between gap-3 shrink-0"><div className="flex items-center gap-3"><div className="w-11 h-11 rounded-2xl bg-gradient-to-tr from-indigo-600 to-violet-500 text-white font-bold text-lg flex items-center justify-center">{candidate.name?.charAt(0).toUpperCase() || 'C'}</div><div><div className="flex items-center gap-2"><h2 className="text-lg font-bold text-slate-100">{candidate.name}</h2><StageBadge stage={candidate.stage} size="sm" /></div><p className="text-xs text-slate-400">Applied for <span className="text-slate-200 font-semibold">{job?.title || candidate.role}</span></p></div></div><div className="flex items-center gap-2"><button onClick={() => setShowDeleteConfirmModal(true)} className="text-xs text-rose-400 px-3 py-1.5 rounded-xl border border-rose-500/20 hover:bg-rose-500/10 font-semibold flex items-center gap-1.5"><Trash2 size={13}/> Delete</button><button onClick={onClose} className="text-slate-400 hover:text-white p-1.5 rounded-lg hover:bg-slate-800"><X size={20}/></button></div></div>
+
+        {/* Duplicate Candidate Detection Alert Banner */}
+        {duplicates.length > 0 && (
+          <div className="mx-6 mt-3 p-3 bg-amber-500/10 border border-amber-500/30 rounded-xl flex items-center justify-between gap-3 text-amber-200 shrink-0">
+            <div className="flex items-center gap-2.5">
+              <AlertCircle size={18} className="text-amber-400 shrink-0" />
+              <div>
+                <p className="text-xs font-semibold text-amber-200">
+                  Potential Duplicate Candidate Detected ({duplicates.length} match{duplicates.length > 1 ? 'es' : ''})
+                </p>
+                <p className="text-[11px] text-amber-300/80">
+                  Matches found based on candidate profile similarity. Review details and merge to unify history.
+                </p>
+              </div>
+            </div>
+            <button
+              onClick={() => setShowDuplicateModal(true)}
+              className="px-3 py-1.5 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold rounded-lg text-xs flex items-center gap-1.5 shrink-0 transition shadow cursor-pointer"
+            >
+              <GitMerge size={14} /> Review & Merge
+            </button>
+          </div>
+        )}
+
+        <div className="flex border-b border-slate-800 bg-slate-950/40 px-6 gap-2 shrink-0 overflow-x-auto">
+          {[
+            { id: 'overview', label: 'Overview & Status', icon: FileText },
+            { id: 'scorecards', label: 'Scorecards', icon: Award, badge: candidate.scorecards?.length ? `${candidate.scorecards.length}` : null },
+            { id: 'timeline', label: 'Timeline', icon: Clock, badge: candidate.timeline?.length ? `${candidate.timeline.length}` : null },
+            { id: 'offer', label: 'Offer', icon: FileCheck, badge: candidate.offer?.status ? candidate.offer.status.toUpperCase() : null },
+            { id: 'interview', label: 'Interview Scheduling', icon: Calendar, badge: candidate.interview ? 'Scheduled' : null },
+            { id: 'resume', label: 'Original Resume', icon: Paperclip },
+          ].map(tab => {
+            const Icon = tab.icon;
+            return (
+              <button
+                key={tab.id}
+                onClick={() => {
+                  if (tab.id === 'resume') handleViewResume();
+                  else setActiveTab(tab.id);
+                }}
+                className={`py-3 px-3 text-xs font-semibold border-b-2 flex items-center gap-2 whitespace-nowrap transition-colors ${
+                  activeTab === tab.id
+                    ? 'border-indigo-500 text-indigo-300'
+                    : 'border-transparent text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                {Icon && <Icon size={14} />}
+                <span>{tab.label}</span>
+                {tab.badge && (
+                  <span className="text-[10px] bg-indigo-500/15 text-indigo-400 px-1.5 py-0.5 rounded-full border border-indigo-500/30 font-mono">
+                    {tab.badge}
+                  </span>
+                )}
+              </button>
+            );
+          })}
+        </div>
+
+        <div className="flex-1 overflow-y-auto custom-scrollbar p-6 space-y-6">
+          {activeTab === 'overview' && <div className="space-y-6">
+            <div className="bg-slate-950 p-5 rounded-2xl border border-slate-800 space-y-4"><div className="flex items-center justify-between"><div className="flex items-center gap-2"><Sparkles size={16} className="text-indigo-400"/><h3 className="text-xs font-bold text-slate-200 uppercase tracking-wider">Hiring Pipeline</h3></div><span className="text-[11px] text-slate-500">Stage changes can email the applicant</span></div><div className="grid grid-cols-1 sm:grid-cols-3 gap-3"><div className="sm:col-span-2"><label className="block text-[11px] font-medium text-slate-400 mb-1">Target Pipeline Stage</label><select value={targetStage} onChange={e=>setTargetStage(e.target.value)} className="w-full bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-xs text-slate-200">{PIPELINE_STAGES.map(s=><option key={s}>{s}</option>)}</select></div><button onClick={handleUpdateStage} disabled={isUpdatingStage||targetStage===candidate.stage} className="h-9 self-end bg-indigo-600 disabled:opacity-40 text-white rounded-xl text-xs font-semibold">{isUpdatingStage?'Updating...':'Apply Stage Change'}</button></div><div><label className="block text-[11px] text-slate-500 mb-1">Optional note to applicant</label><input value={stageNote} onChange={e=>setStageNote(e.target.value)} placeholder="Optional status note" className="w-full bg-slate-900 border border-slate-800 rounded-xl px-3 py-2 text-xs text-slate-200"/></div></div>
+
+            <div className="grid lg:grid-cols-[minmax(0,1fr)_340px] gap-5"><div className="bg-slate-950 p-5 rounded-2xl border border-slate-800 space-y-4"><h3 className="text-xs font-bold text-slate-200 uppercase tracking-wider">Candidate Information</h3><div className="grid sm:grid-cols-2 gap-4 text-xs"><div><span className="text-slate-500 block">Email</span><span className="font-semibold text-slate-200">{candidate.email}</span></div><div><span className="text-slate-500 block">Phone</span><span className="font-semibold text-slate-200">{candidate.phone || '—'}</span></div><div><span className="text-slate-500 block">Applied On</span><span className="font-semibold text-slate-200">{candidate.createdAt ? new Date(candidate.createdAt).toLocaleDateString() : '—'}</span></div><div><span className="text-slate-500 block">Resume</span><button onClick={handleViewResume} className="text-indigo-400 font-semibold inline-flex items-center gap-1">{resumeLoading?'Loading...':'View original'} <ExternalLink size={11}/></button></div></div>{candidate.skills?.length>0&&<div><span className="text-slate-500 text-[11px] block mb-1.5">Identified Skills</span><div className="flex flex-wrap gap-1.5">{candidate.skills.map((skill,idx)=><span key={idx} className="bg-slate-900 text-slate-300 border border-slate-800 text-[11px] px-2.5 py-0.5 rounded-lg">{skill}</span>)}</div></div>}{candidate.experienceSummary&&<div className="pt-2 border-t border-slate-800"><span className="text-slate-500 text-[11px] block mb-1">Experience Summary</span><p className="text-xs text-slate-300 leading-relaxed bg-slate-900/60 p-3 rounded-xl">{candidate.experienceSummary}</p></div>}</div>
+
+              <div className="bg-slate-950 p-5 rounded-2xl border border-slate-800 space-y-4"><div className="flex items-center justify-between"><span className="text-[11px] font-bold text-slate-400 uppercase tracking-wider flex items-center gap-1.5"><BrainCircuit size={13} className="text-indigo-400"/> ATS Match Score</span><span className="text-[10px] text-slate-500">Deterministic</span></div>{candidate.geminiScore != null ? <><div className={`text-4xl font-extrabold text-center ${candidate.geminiScore>=80?'text-emerald-400':candidate.geminiScore>=60?'text-amber-400':'text-rose-400'}`}>{candidate.geminiScore}<span className="text-sm font-normal text-slate-500">/100</span></div>{candidate.screeningBreakdown&&<div className="space-y-1.5 text-[11px]">{[['Required skills','requiredSkills'],['Non-required skills','nonRequiredSkills'],['Experience','experience']].map(([label,key])=><div key={key} className="flex justify-between"><span className="text-slate-500">{label} ({candidate.screeningWeights?.[key] ?? job?.scoringWeights?.[key] ?? 0}%)</span><span className="text-slate-200 font-semibold">{candidate.screeningBreakdown[key]}%</span></div>)}</div>}<p className="text-[11px] text-slate-300 bg-indigo-500/5 border border-indigo-500/20 p-3 rounded-xl leading-relaxed">{candidate.geminiRationale}</p></> : <p className="text-xs text-slate-500 text-center py-5">No screening score yet.</p>} {screeningError&&<p className="text-[11px] text-rose-400">{screeningError}</p>}<button onClick={handleScreenCandidate} disabled={isScreening} className="w-full py-2 rounded-xl text-xs font-semibold bg-indigo-600/15 border border-indigo-500/30 text-indigo-300 flex items-center justify-center gap-2">{isScreening?<><Spinner className="w-3.5 h-3.5"/>Recalculating...</>:<><RefreshCw size={12}/>{candidate.geminiScore!=null?'Recalculate Score':'Run ATS Screening'}</>}</button></div></div>
+
+            <div className="bg-slate-950 p-5 rounded-2xl border border-slate-800 space-y-3"><div className="flex items-center justify-between"><h3 className="text-xs font-bold text-slate-200 uppercase tracking-wider flex items-center gap-2"><MessageSquare size={15} className="text-indigo-400"/> Internal Recruiter Notes</h3>{notesSaved&&<span className="text-xs text-emerald-400"><Check size={13}/> Saved</span>}</div><textarea rows={4} value={notes} onChange={e=>setNotes(e.target.value)} className="w-full bg-slate-900 border border-slate-800 rounded-xl p-3.5 text-xs text-slate-200"/><div className="flex justify-end"><button onClick={handleSaveNotes} disabled={isSavingNotes} className="px-4 py-2 rounded-xl text-xs font-semibold bg-slate-800 text-slate-200 border border-slate-700">{isSavingNotes?'Saving...':'Save Recruiter Notes'}</button></div></div>
+          </div>}
+
+          {activeTab === 'interview' && <form onSubmit={handleScheduleInterview} className="space-y-5"><div className="bg-slate-950 p-5 rounded-2xl border border-slate-800 space-y-4"><div><h3 className="text-sm font-bold text-slate-100 flex items-center gap-2"><Calendar size={16} className="text-indigo-400"/>{candidate.interview?'Reschedule Interview':'Schedule Candidate Interview'}</h3><p className="text-xs text-slate-400 mt-1">Booked times are disabled. The selected time is also checked again on the server.</p></div><div className="grid md:grid-cols-2 gap-4"><div><label className="block text-xs font-medium text-slate-400 mb-1">Date *</label><input type="date" required value={interviewDate} onChange={e => handleDateChange(e.target.value)} className="w-full bg-slate-900 border border-slate-800 rounded-xl px-3 py-2 text-xs text-slate-200"/></div><div><label className="block text-xs font-medium text-slate-400 mb-1">Time *</label><div className="flex items-center justify-center gap-1 bg-slate-900 border border-slate-800 rounded-xl p-2">
+              {[{ label: 'Hour', value: pad(displayHour), up: () => changeHour(1), down: () => changeHour(-1) }, { label: 'Minute', value: pad(selectedMinute), up: () => changeMinute(1), down: () => changeMinute(-1) }, { label: 'AM/PM', value: displayPeriod, up: () => changePeriod(1), down: () => changePeriod(-1) }].map(column => (
+                <div key={column.label} className="flex flex-col items-center time-wheel-column">
+                  <button type="button" onClick={column.up} aria-label={`Increase ${column.label}`} className="time-wheel-arrow w-12 h-7 rounded-t-lg bg-slate-800 border border-slate-700 text-slate-200 hover:bg-indigo-600/20 hover:text-white flex items-center justify-center text-lg font-bold">↑</button>
+                  <div
+                    key={`${column.label}-${column.value}-${timeWheelMotion?.column === column.label ? timeWheelMotion.key : ''}`}
+                    className={`time-wheel-value w-12 h-10 flex items-center justify-center bg-slate-950 border-x border-slate-700 text-base font-bold text-slate-100 font-mono ${
+                      timeWheelMotion?.column === column.label
+                        ? timeWheelMotion.direction > 0 ? 'time-wheel-value--up' : 'time-wheel-value--down'
+                        : ''
+                    }`}
+                  >{column.value}</div>
+                  <button type="button" onClick={column.down} aria-label={`Decrease ${column.label}`} className="time-wheel-arrow w-12 h-7 rounded-b-lg bg-slate-800 border border-slate-700 text-slate-200 hover:bg-indigo-600/20 hover:text-white flex items-center justify-center text-lg font-bold">↓</button>
+                  <span className="text-[8px] uppercase tracking-wider text-slate-600 mt-1">{column.label}</span>
+                </div>
+              ))}
+            </div><p className="text-[10px] text-slate-600 mt-1">Hour and minute are independent. Minutes move in 5-minute steps. The clock supports the full 24-hour day.</p></div></div><div>{loadingAvailability?<p className="text-[10px] text-slate-500">Checking availability...</p>:bookings.length>0?<div className="flex flex-wrap gap-1.5"><span className="text-[10px] text-slate-500 mr-1">Booked:</span>{bookings.map(item=><span key={item.applicationId+item.scheduledAt} className="text-[10px] text-rose-300 bg-rose-500/10 border border-rose-500/20 px-2 py-1 rounded-lg">{new Date(item.scheduledAt).toLocaleTimeString([], {hour:'numeric',minute:'2-digit'})}</span>)}</div>:<p className="text-[10px] text-emerald-400">No interviews booked for this date.</p>}</div><div className="grid md:grid-cols-2 gap-4"><div><label className="block text-xs font-medium text-slate-400 mb-1">Interviewer(s) *</label><input required value={interviewer} onChange={e => handleInterviewerChange(e.target.value)} className="w-full bg-slate-900 border border-slate-800 rounded-xl px-3 py-2 text-xs text-slate-200"/></div><div><label className="block text-xs font-medium text-slate-400 mb-1">Video Meeting URL</label><input type="url" value={meetingLink} onChange={e => handleMeetingLinkChange(e.target.value)} placeholder="https://meet.google.com/xyz" className="w-full bg-slate-900 border border-slate-800 rounded-xl px-3 py-2 text-xs text-slate-200"/></div></div></div>
+
+            <div className="bg-slate-950 p-5 rounded-2xl border border-slate-800 space-y-4">
+              <div>
+                <h3 className="text-xs font-bold text-slate-200 uppercase tracking-wider flex items-center gap-2">
+                  <MailIcon/> Email Composer
+                </h3>
+                <p className="text-[10px] text-slate-500 mt-1">
+                  The email below is sent to the applicant's actual email address through your configured provider.
+                </p>
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-400 mb-1">To</label>
+                <input value={candidate.email} readOnly className="w-full bg-slate-900 border border-slate-800 rounded-xl px-3 py-2 text-xs text-slate-400"/>
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-400 mb-1">Subject *</label>
+                <input required value={emailSubject} onChange={e=>setEmailSubject(e.target.value)} className="w-full bg-slate-900 border border-slate-800 rounded-xl px-3 py-2 text-xs text-slate-200"/>
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-slate-400 mb-1">Body *</label>
+                <textarea required rows={9} value={emailBody} onChange={e=>setEmailBody(e.target.value)} className="w-full bg-slate-900 border border-slate-800 rounded-xl p-3 text-xs text-slate-200 font-sans leading-relaxed"/>
+              </div>
+              <div>
+                <div className="flex items-center justify-between mb-1">
+                  <label className="block text-xs font-medium text-slate-400">Attachments</label>
+                  <span className="text-[10px] text-slate-500">Max 5 files &bull; Up to 10 MB each</span>
+                </div>
+                <div className="flex flex-wrap items-center gap-3">
+                  <label className="inline-flex items-center gap-2 px-3 py-2 rounded-xl bg-slate-900 border border-slate-800 text-xs text-slate-300 cursor-pointer hover:border-slate-600 transition-colors">
+                    <Paperclip size={14} className="text-indigo-400" /> Add attachments
+                    <input
+                      type="file"
+                      multiple
+                      accept=".pdf,.docx,.doc,.txt,.png,.jpg,.jpeg,.webp,.ics"
+                      className="hidden"
+                      onChange={handleAttachmentChange}
+                    />
+                  </label>
+                  <span className="text-[11px] text-slate-500">
+                    Supported: PDF, DOCX, DOC, TXT, PNG, JPG, WEBP, ICS
+                  </span>
+                </div>
+                {attachmentError && (
+                  <div className="mt-2 text-xs text-rose-400 bg-rose-500/10 border border-rose-500/20 px-3 py-2 rounded-xl flex items-center gap-2">
+                    <AlertCircle size={14} className="shrink-0" />
+                    <span>{attachmentError}</span>
+                  </div>
+                )}
+                {attachments.length > 0 && (
+                  <div className="mt-3 space-y-1.5">
+                    {attachments.map((file, idx) => (
+                      <div key={`${file.name}-${file.size}-${idx}`} className="text-xs text-slate-300 bg-slate-900 border border-slate-800 px-3 py-1.5 rounded-xl flex items-center justify-between">
+                        <div className="flex items-center gap-2 truncate">
+                          <FileText size={14} className="text-indigo-400 shrink-0" />
+                          <span className="truncate">{file.name}</span>
+                          <span className="text-[10px] text-slate-500 shrink-0">({Math.round(file.size / 1024)} KB)</span>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => handleRemoveAttachment(idx)}
+                          className="text-slate-500 hover:text-rose-400 p-1 transition-colors"
+                          title="Remove attachment"
+                        >
+                          <X size={14} />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <div className="flex items-center justify-between">{interviewSuccess?<span className="text-xs text-emerald-400 flex items-center gap-1.5"><CheckCircle2 size={15}/> Interview scheduled and email sent.</span>:<span/>}<button type="submit" disabled={isScheduling||bookedSlotSet.has(selectedTime)} className="px-5 py-2.5 rounded-xl text-xs font-semibold bg-indigo-600 text-white disabled:opacity-40 flex items-center gap-2">{isScheduling?<Spinner className="w-3.5 h-3.5"/>:<Send size={14}/>} {isScheduling?'Preparing...':'Review & Schedule'}</button></div></form>}
+
+          {activeTab === 'resume' && (
+            <div className="space-y-4">
+              <div className="flex items-center justify-between">
+                <div>
+                  <h3 className="text-sm font-bold text-slate-100 flex items-center gap-2">
+                    <FileText size={16} className="text-indigo-400"/> Original Resume
+                  </h3>
+                  <p className="text-[11px] text-slate-500">
+                    {candidate.resumeFile?.originalName || candidate.fileName || 'No file attached'}
+                  </p>
+                </div>
+                {candidate.resumeFile && (
+                  <button
+                    onClick={async () => {
+                      try {
+                        const { blob } = await api.applications.getResumeBlob(candidate.id);
+                        const url = URL.createObjectURL(blob);
+                        const a = document.createElement('a');
+                        a.href = url;
+                        a.download = candidate.resumeFile.originalName || candidate.fileName || `${candidate.name.replace(/\s+/g, '_')}_resume.pdf`;
+                        a.click();
+                        setTimeout(() => URL.revokeObjectURL(url), 1000);
+                      } catch (err) {
+                        setResumeError(err.message);
+                      }
+                    }}
+                    className="px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs text-slate-200 flex items-center gap-2 transition-colors"
+                  >
+                    <Download size={13}/> Download File
+                  </button>
+                )}
+              </div>
+
+              {resumeError && (
+                <div className="p-3 rounded-xl bg-amber-500/10 border border-amber-500/20 text-amber-300 text-xs flex gap-2">
+                  <AlertCircle size={14} className="shrink-0 mt-0.5"/>
+                  <span>{resumeError}</span>
+                </div>
+              )}
+
+              {resumeLoading ? (
+                <div className="py-24 text-center bg-slate-950 rounded-2xl border border-slate-800 space-y-3">
+                  <Spinner className="w-8 h-8 text-indigo-400 mx-auto" />
+                  <p className="text-xs text-slate-400 font-medium">Fetching original document...</p>
+                </div>
+              ) : resumeUrl && (
+                candidate.resumeFile?.mimeType?.toLowerCase() === 'application/pdf' ||
+                candidate.resumeFile?.originalName?.toLowerCase()?.endsWith('.pdf') ||
+                candidate.fileName?.toLowerCase()?.endsWith('.pdf')
+              ) ? (
+                <iframe
+                  title={`${candidate.name} original resume`}
+                  src={resumeUrl}
+                  className="w-full h-[650px] rounded-xl border border-slate-800 bg-white shadow-inner"
+                />
+              ) : (
+                <div className="bg-slate-950 p-6 rounded-2xl border border-slate-800 text-center space-y-3">
+                  <FileText size={32} className="mx-auto text-slate-600"/>
+                  <p className="text-sm text-slate-300">
+                    {candidate.resumeFile
+                      ? 'The original file is stored. PDFs can be previewed directly in this viewer; DOCX/TXT documents can be downloaded above.'
+                      : 'This older demo application has extracted resume text but no original upload. New applications will retain the original file.'}
+                  </p>
+                  {candidate.resumeText && (
+                    <details className="text-left mt-2">
+                      <summary className="cursor-pointer text-xs text-indigo-300 hover:text-indigo-200 select-none">
+                        Show extracted text for cross-reference
+                      </summary>
+                      <div className="mt-3 p-4 bg-slate-900 rounded-xl text-xs font-mono text-slate-300 whitespace-pre-wrap leading-relaxed max-h-[450px] overflow-y-auto border border-slate-800">
+                        {candidate.resumeText}
+                      </div>
+                    </details>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+
+          {activeTab === 'scorecards' && (
+            <ScorecardTab
+              candidate={candidate}
+              application={candidate}
+              job={job}
+              onUpdateCandidate={onUpdateCandidate}
+              onUpdateApplication={onUpdateCandidate}
+            />
+          )}
+
+          {activeTab === 'timeline' && (
+            <CandidateTimelineTab
+              candidate={candidate}
+              application={candidate}
+              onUpdateCandidate={onUpdateCandidate}
+              onUpdateApplication={onUpdateCandidate}
+            />
+          )}
+
+          {activeTab === 'offer' && (
+            <OfferManagementTab
+              candidate={candidate}
+              application={candidate}
+              job={job}
+              onUpdateCandidate={onUpdateCandidate}
+              onUpdateApplication={onUpdateCandidate}
+            />
+          )}
+
+
+        {showScheduleConfirmation && (
+          <div className="fixed inset-0 z-[80] bg-slate-950/75 backdrop-blur-sm flex items-center justify-center p-4">
+            <div
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="schedule-confirmation-title"
+              className="w-full max-w-2xl max-h-[88vh] overflow-hidden bg-slate-900 border border-slate-700 rounded-2xl shadow-2xl flex flex-col"
+            >
+              <div className="p-5 border-b border-slate-800 flex items-center justify-between">
+                <div>
+                  <div className="flex items-center gap-2 text-amber-300">
+                    <AlertCircle size={17}/>
+                    <h3 id="schedule-confirmation-title" className="text-sm font-bold text-slate-100">Confirm Interview Schedule</h3>
+                  </div>
+                  <p className="text-[11px] text-slate-400 mt-1">Review the final email and interview time before anything is sent.</p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setShowScheduleConfirmation(false)}
+                  className="text-slate-400 hover:text-white p-1.5 rounded-lg hover:bg-slate-800"
+                  aria-label="Close confirmation"
+                  disabled={isScheduling}
+                >
+                  <X size={18}/>
+                </button>
+              </div>
+
+              <div className="flex-1 overflow-y-auto custom-scrollbar p-5 space-y-4">
+                <div className="grid sm:grid-cols-2 gap-3">
+                  <div className="bg-slate-950 border border-slate-800 rounded-xl p-4">
+                    <p className="text-[10px] uppercase tracking-wider text-slate-500 mb-1">Candidate</p>
+                    <p className="text-xs font-semibold text-slate-100">{candidate.name}</p>
+                    <p className="text-[11px] text-slate-400 mt-0.5">{candidate.email}</p>
+                  </div>
+                  <div className="bg-indigo-500/5 border border-indigo-500/20 rounded-xl p-4">
+                    <p className="text-[10px] uppercase tracking-wider text-indigo-300 mb-1">Interview Time</p>
+                    <p className="text-sm font-bold text-white">
+                      {new Date(`${interviewDate}T00:00:00`).toLocaleDateString([], { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' })}
+                    </p>
+                    <p className="text-xs text-indigo-200 mt-1">{formatTime(selectedTime)}</p>
+                  </div>
+                </div>
+
+                <div className="bg-slate-950 border border-slate-800 rounded-xl p-4 space-y-3">
+                  <div className="grid sm:grid-cols-2 gap-3 text-xs">
+                    <div><span className="text-slate-500">Interviewer(s)</span><p className="text-slate-200 font-semibold mt-0.5">{interviewer}</p></div>
+                    <div><span className="text-slate-500">Meeting Link</span><p className="text-slate-200 font-semibold mt-0.5 break-all">{meetingLink || 'None provided'}</p></div>
+                  </div>
+                </div>
+
+                <div className="bg-slate-950 border border-slate-800 rounded-xl p-4">
+                  <p className="text-[10px] uppercase tracking-wider text-slate-500 mb-1">Email Preview</p>
+                  <div className="text-[11px] text-slate-500 mb-1">To: <span className="text-slate-300">{candidate.email}</span></div>
+                  <div className="text-xs font-semibold text-indigo-300 mb-3">{emailSubject}</div>
+                  <div className="max-h-64 overflow-y-auto custom-scrollbar rounded-lg border border-slate-800 bg-slate-900 p-3 text-xs text-slate-300 whitespace-pre-wrap leading-relaxed">{emailBody}</div>
+                  {attachments.length > 0 && (
+                    <div className="mt-3 pt-3 border-t border-slate-800">
+                      <p className="text-[10px] text-slate-500 mb-1.5">Attachments ({attachments.length})</p>
+                      <div className="flex flex-wrap gap-1.5">
+                        {attachments.map((file, idx) => (
+                          <span key={`${file.name}-${file.size}-${idx}`} className="text-[10px] text-slate-300 bg-slate-900 border border-slate-800 px-2.5 py-1 rounded-lg flex items-center gap-1.5">
+                            <FileText size={12} className="text-indigo-400" />
+                            {file.name}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                <div className="text-[11px] text-amber-300 bg-amber-500/10 border border-amber-500/20 rounded-xl px-3 py-2.5">
+                  This action will save the interview schedule and send the email to the candidate.
+                </div>
+              </div>
+
+              <div className="p-4 border-t border-slate-800 flex justify-end gap-2 bg-slate-900/90">
+                <button
+                  type="button"
+                  onClick={() => setShowScheduleConfirmation(false)}
+                  disabled={isScheduling}
+                  className="px-4 py-2.5 rounded-xl text-xs font-semibold text-slate-300 bg-slate-800 hover:bg-slate-700 disabled:opacity-50"
+                >
+                  Go Back & Edit
+                </button>
+                <button
+                  type="button"
+                  onClick={handleConfirmScheduleInterview}
+                  disabled={isScheduling}
+                  className="px-4 py-2.5 rounded-xl text-xs font-semibold text-white bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 flex items-center gap-2"
+                >
+                  {isScheduling ? <Spinner className="w-3.5 h-3.5"/> : <Send size={14}/>} {isScheduling ? 'Sending...' : 'Confirm & Send'}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+        </div>
+      </div>
+
+      {/* Confirmation Modal for Stage Progression (PATCH /applications/:id/stage) */}
+      <ConfirmationModal
+        isOpen={showStageConfirmModal}
+        onClose={() => setShowStageConfirmModal(false)}
+        onConfirm={handleExecuteUpdateStage}
+        isLoading={isUpdatingStage}
+        title="Confirm Pipeline Stage Progression"
+        message={`Are you sure you want to advance ${candidate.name} to "${targetStage}"?`}
+        details={{
+          'Candidate': candidate.name,
+          'Current Stage': candidate.stage,
+          'Target Stage': targetStage,
+          'Optional Status Note': stageNote || 'None provided'
+        }}
+        confirmText="Apply Stage Move"
+        variant="primary"
+      />
+
+      {/* Confirmation Modal for Saving Recruiter Notes (PATCH /applications/:id/notes) */}
+      <ConfirmationModal
+        isOpen={showNotesConfirmModal}
+        onClose={() => setShowNotesConfirmModal(false)}
+        onConfirm={handleExecuteSaveNotes}
+        isLoading={isSavingNotes}
+        title="Save Recruiter Evaluation Notes"
+        message={`Save the updated internal evaluation notes for ${candidate.name}?`}
+        confirmText="Save Notes"
+        variant="primary"
+      />
+
+      {/* Confirmation Modal for ATS Screening (POST /ai/screen) */}
+      <ConfirmationModal
+        isOpen={showScreeningConfirmModal}
+        onClose={() => setShowScreeningConfirmModal(false)}
+        onConfirm={handleExecuteScreenCandidate}
+        isLoading={isScreening}
+        title="Run ATS Scoring Calculation"
+        message={`Calculate the deterministic ATS matching score for ${candidate.name} against the target job requirements?`}
+        details={{
+          'Candidate': candidate.name,
+          'Role': job?.title || candidate.role,
+          'Identified Skills': candidate.skills?.length > 0 ? candidate.skills.join(', ') : 'None extracted'
+        }}
+        confirmText="Calculate Score"
+        variant="primary"
+      />
+
+      {/* Confirmation Modal for Deleting Candidate Record (DELETE /applications/:id) */}
+      <ConfirmationModal
+        isOpen={showDeleteConfirmModal}
+        onClose={() => setShowDeleteConfirmModal(false)}
+        onConfirm={() => {
+          setShowDeleteConfirmModal(false);
+          onDelete(candidate);
+        }}
+        title="Delete Candidate Record"
+        message={`Are you sure you want to delete the application record for ${candidate.name}? This action cannot be undone.`}
+        details={{
+          'Candidate': candidate.name,
+          'Email': candidate.email,
+          'Position': job?.title || candidate.role
+        }}
+        confirmText="Delete Candidate"
+        variant="danger"
+        icon={Trash2}
+      />
+
+      {/* Duplicate Candidate Detection & Merge Modal */}
+      {showDuplicateModal && (
+        <DuplicateDetectionModal
+          primaryCandidate={candidate}
+          duplicateMatches={duplicates}
+          isOpen={showDuplicateModal}
+          onClose={() => setShowDuplicateModal(false)}
+          onMerged={(updatedCandidate) => {
+            setShowDuplicateModal(false);
+            onUpdateCandidate(updatedCandidate);
+            setDuplicates([]);
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+function MailIcon() { return <span className="inline-flex"><Send size={13} className="text-indigo-400"/></span>; }
